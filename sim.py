@@ -2,138 +2,150 @@ import numpy as np
 import pandas as pd
 import math
 
-def taylor_pnl(
+def _kth_order_term(dX: np.ndarray, tensor: np.ndarray, k: int) -> np.ndarray:
+    """
+    Compute the k-th order Taylor contribution for all time rows in dX.
+
+    dX     : shape (T, F)  factor moves for each date
+    tensor : sensitivities for this order k
+             - shape (F,)           => diagonal-only for this order
+             - shape (F,)*k         => full cross tensor for this order
+    k      : integer order
+
+    Returns
+    -------
+    term : shape (T,) P&L contribution from this order
+    """
+    T, F = dX.shape
+    coeff = 1.0 / math.factorial(k)
+    tensor = np.asarray(tensor, dtype=float)
+
+    # Case A: diagonal-only vector
+    if tensor.ndim == 1:
+        if tensor.shape[0] != F:
+            raise ValueError(
+                f"Order {k}: diagonal vector length {tensor.shape[0]} "
+                f"!= num factors {F}"
+            )
+        # P_n(t) = 1/k! * sum_i tensor[i] * (dX[t,i])^k
+        return coeff * np.einsum("tf,f->t", (dX ** k), tensor)
+
+    # Case B: full tensor of rank k
+    expected_shape = (F,) * k
+    if tensor.shape != expected_shape:
+        raise ValueError(
+            f"Order {k}: tensor must have shape {expected_shape}, got {tensor.shape}"
+        )
+
+    # Build einsum string dynamically.
+    #
+    # For k=2:
+    #   einsum('ti,tj,ij->t', dX, dX, tensor)
+    #
+    # For k=3:
+    #   einsum('ti,tj,tk,ijk->t', dX, dX, dX, tensor)
+    #
+    # General:
+    #   'ti,tj,tk,...,ijk...->t'
+    idx_letters_pool = list("ijklmnopqrstuvwxyzabcdefgh")  # enough distinct indices
+    idx_letters = idx_letters_pool[:k]  # e.g. ['i','j','k'] for k=3
+
+    dX_terms = [f"t{ix}" for ix in idx_letters]     # ['ti','tj','tk',...]
+    tens_term = "".join(idx_letters)                # 'ijk...'
+
+    eins_lhs = ",".join(dX_terms + [tens_term])     # 'ti,tj,tk,ijk'
+    eins_rhs = "t"
+    eins_sub = f"{eins_lhs}->{eins_rhs}"
+
+    args = [dX] * k + [tensor]
+
+    return coeff * np.einsum(eins_sub, *args)
+
+
+def taylor_pnl_general(
     moves_df: pd.DataFrame,
-    risk_dict: dict
+    risk_dict: dict,
+    order_map: dict
 ) -> pd.DataFrame:
     """
-    Compute P&L per date using Taylor expansion up to Nth order.
+    General n-th order Taylor P&L expansion with explicit order mapping.
 
     Parameters
     ----------
     moves_df : pd.DataFrame
         Index = dates, columns = risk factors.
-        Values = actual factor moves Δx_i for that date.
-        Column order defines factor index order.
+        Values = Δx for each factor on each date.
+        Shape (T, F).
 
     risk_dict : dict
-        Keys like "first_order", "second_order", ..., "n_order".
-        Values are sensitivities for that order:
-            order 1: shape (F,)
-            order 2: shape (F,F)  or (F,) for diagonal-only
-            order k: shape (F,)*k or (F,) for diagonal-only kth-order term.
-        Assumed to be w.r.t. the SAME factor ordering as moves_df.columns.
+        Dict of sensitivities. Each key is a label for a derivative block.
+        Each value is either:
+          - 1D array length F      (diagonal terms only for that order)
+          - full tensor of shape (F, F, ..., F) with k repeats (full cross terms)
+        IMPORTANT: same factor ordering as moves_df.columns.
+
+        Example:
+        {
+            "first_derivative":  [delta_RF1, delta_RF2, ...],
+            "second_derivative": [[gamma_11, gamma_12, ...],
+                                   ...                     ],
+            "third_derivative":  [skew_RF1, skew_RF2, ...]
+        }
+
+    order_map : dict
+        Maps each key in risk_dict -> integer order k.
+        Example:
+        {
+            "first_derivative": 1,
+            "second_derivative": 2,
+            "third_derivative": 3,
+        }
+
+        This tells us how to scale with 1/k!, and what power
+        of dX to use.
 
     Returns
     -------
     pd.DataFrame
-        Columns:
-          - 'order_1', 'order_2', ..., 'total'
-        Index = same as moves_df.index
+        Columns: one per order ("order_1", "order_2", ...), plus "total".
+        Index  : same as moves_df.index
+
+        Each column order_k is the P&L contribution from exactly that order.
+        "total" is the sum across all provided orders.
     """
 
-    # --- prep
-    factors = list(moves_df.columns)
-    dX = moves_df.to_numpy()              # shape (T, F)
+    # factor moves matrix
+    dX = moves_df.to_numpy()  # shape (T, F)
     T, F = dX.shape
 
-    # We'll accumulate per-order pnl in a dict of arrays shape (T,)
-    pnl_terms = {}
-    total_pnl = np.zeros(T)
+    # Sanity: all keys in risk_dict must exist in order_map
+    missing = [k for k in risk_dict.keys() if k not in order_map]
+    if missing:
+        raise ValueError(f"order_map missing entries for keys: {missing}")
 
-    # helper: safe factorial coeff
-    def coeff(k: int) -> float:
-        return 1.0 / math.factorial(k)
+    # We'll accumulate PnL per *order k*
+    pnl_by_order = {}  # k -> np.array shape (T,)
 
-    # iterate orders present in risk_dict
-    # We'll parse keys like "first_order","second_order","third_order",...
-    for key, sens in risk_dict.items():
-        # infer order k from key
-        # we'll strip "_order" and map 'first','second','third','fourth',...
-        # fallback: try to parse leading int if user uses "order_3" style
-        order_name = key.lower().strip()
+    for risk_key, sens in risk_dict.items():
+        k = int(order_map[risk_key])
 
-        # try common english ordinals first
-        ordinal_map = {
-            "first": 1, "second": 2, "third": 3, "fourth": 4,
-            "fifth": 5, "sixth": 6, "seventh": 7, "eighth": 8,
-            "ninth": 9, "tenth": 10
-        }
-        k = None
-        for word, val in ordinal_map.items():
-            if order_name.startswith(word):
-                k = val
-                break
-        if k is None:
-            # fallback patterns like "order_3", "3rd_order", "thirdorder"
-            import re
-            m = re.search(r'(\d+)', order_name)
-            if m:
-                k = int(m.group(1))
-        if k is None:
-            raise ValueError(f"Cannot infer order from key '{key}'")
+        term_vec = _kth_order_term(dX, np.asarray(sens, dtype=float), k)
 
-        S = np.array(sens, dtype=float)
-
-        # compute kth order pnl term for all T days ->
-        # term_t = (1/k!) * sum_{i1..ik} S[i1..ik] * dX[t,i1]*...*dX[t,ik]
-
-        if S.ndim == 1:
-            # interpret as diagonal-only for that order:
-            # term_t = (1/k!) * sum_i S[i] * (dX[t,i])^k
-            # So you gave only the pure self term per factor.
-            if S.shape[0] != F:
-                raise ValueError(f"{key}: diagonal vector length {S.shape[0]} "
-                                 f"!= num factors {F}")
-            term = coeff(k) * np.sum(
-                (S * (dX ** k)), axis=1
-            )  # shape (T,)
+        # If multiple blocks map to same k, sum them (rare but allowed)
+        if k in pnl_by_order:
+            pnl_by_order[k] = pnl_by_order[k] + term_vec
         else:
-            # full tensor case
-            # Example:
-            # k=2 -> S shape (F,F)
-            # k=3 -> S shape (F,F,F)
-            # etc.
-            # We'll use einsum:
-            # For k=2: term_t = 1/2 * Σ_ij S_ij dX_ti dX_tj
-            # -> einsum('t i, i j, t j -> t', dX, S, dX)
-            #
-            # For k=3: term_t = 1/6 * Σ_ijk S_ijk dX_ti dX_tj dX_tk
-            # -> einsum('t i, t j, t k, i j k -> t', dX, dX, dX, S)
-            #
-            # General k: einsum over: k copies of dX plus S.
+            pnl_by_order[k] = term_vec
 
-            if S.shape != (F,) * k:
-                raise ValueError(
-                    f"{key}: tensor shape {S.shape} does not match "
-                    f"(num_factors,)*{k} = {(F,)*k}"
-                )
+    # Build output dataframe
+    out_cols = {}
+    total = np.zeros(T)
 
-            # build einsum subscripts programmatically
-            # We'll create something like:
-            # inputs:  ['t i', 't j', 't k', 'i j k']
-            # output:  't'
-            idx_letters = list("ijklmnopqrstuvwxyzabcdefgh")  # enough distinct indices
-            idx = idx_letters[:k]  # e.g. ['i','j','k'] for k=3
+    for k in sorted(pnl_by_order.keys()):
+        col_name = f"order_{k}"
+        out_cols[col_name] = pnl_by_order[k]
+        total += pnl_by_order[k]
 
-            # dX term subscripts: 't i', 't j', ...
-            dX_terms = [f"t {ix}" for ix in idx]
-            # S term subscripts: 'i j k'
-            S_term = " ".join(idx)
+    out_cols["total"] = total
 
-            einsum_input = ",".join(dX_terms + [S_term])
-            einsum_output = "t"
-            subscript = f"{einsum_input}->{einsum_output}"
-
-            # Prepare args: k copies of dX plus S
-            args = [dX] * k + [S]
-
-            term = coeff(k) * np.einsum(subscript, *args)  # shape (T,)
-
-        pnl_terms[f"order_{k}"] = term
-        total_pnl += term
-
-    # final output dataframe
-    out = pd.DataFrame(index=moves_df.index, data=pnl_terms)
-    out["total"] = total_pnl
-    return out
+    return pd.DataFrame(out_cols, index=moves_df.index)
