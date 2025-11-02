@@ -1,151 +1,133 @@
 import numpy as np
-import pandas as pd
-import math
+from scipy.interpolate import CubicSpline
 
-def _kth_order_term(dX: np.ndarray, tensor: np.ndarray, k: int) -> np.ndarray:
+def interpolate_points(
+    x_known: np.ndarray,
+    y_known: np.ndarray,
+    x_query: np.ndarray,
+    interp_method: str = "linear",    # "linear" or "cubic"
+    extrap_method: str = "linear",    # "flat", "linear", or "cubic"
+):
     """
-    Compute the k-th order Taylor contribution for all time rows in dX.
-
-    dX     : shape (T, F)  factor moves for each date
-    tensor : sensitivities for this order k
-             - shape (F,)           => diagonal-only for this order
-             - shape (F,)*k         => full cross tensor for this order
-    k      : integer order
-
-    Returns
-    -------
-    term : shape (T,) P&L contribution from this order
-    """
-    T, F = dX.shape
-    coeff = 1.0 / math.factorial(k)
-    tensor = np.asarray(tensor, dtype=float)
-
-    # Case A: diagonal-only vector
-    if tensor.ndim == 1:
-        if tensor.shape[0] != F:
-            raise ValueError(
-                f"Order {k}: diagonal vector length {tensor.shape[0]} "
-                f"!= num factors {F}"
-            )
-        # P_n(t) = 1/k! * sum_i tensor[i] * (dX[t,i])^k
-        return coeff * np.einsum("tf,f->t", (dX ** k), tensor)
-
-    # Case B: full tensor of rank k
-    expected_shape = (F,) * k
-    if tensor.shape != expected_shape:
-        raise ValueError(
-            f"Order {k}: tensor must have shape {expected_shape}, got {tensor.shape}"
-        )
-
-    # Build einsum string dynamically.
-    #
-    # For k=2:
-    #   einsum('ti,tj,ij->t', dX, dX, tensor)
-    #
-    # For k=3:
-    #   einsum('ti,tj,tk,ijk->t', dX, dX, dX, tensor)
-    #
-    # General:
-    #   'ti,tj,tk,...,ijk...->t'
-    idx_letters_pool = list("ijklmnopqrstuvwxyzabcdefgh")  # enough distinct indices
-    idx_letters = idx_letters_pool[:k]  # e.g. ['i','j','k'] for k=3
-
-    dX_terms = [f"t{ix}" for ix in idx_letters]     # ['ti','tj','tk',...]
-    tens_term = "".join(idx_letters)                # 'ijk...'
-
-    eins_lhs = ",".join(dX_terms + [tens_term])     # 'ti,tj,tk,ijk'
-    eins_rhs = "t"
-    eins_sub = f"{eins_lhs}->{eins_rhs}"
-
-    args = [dX] * k + [tensor]
-
-    return coeff * np.einsum(eins_sub, *args)
-
-
-def taylor_pnl_general(
-    moves_df: pd.DataFrame,
-    risk_dict: dict,
-    order_map: dict
-) -> pd.DataFrame:
-    """
-    General n-th order Taylor P&L expansion with explicit order mapping.
+    Interpolate and extrapolate y for given x_query with independently chosen
+    interpolation method (inside domain) and extrapolation method (outside domain).
 
     Parameters
     ----------
-    moves_df : pd.DataFrame
-        Index = dates, columns = risk factors.
-        Values = Δx for each factor on each date.
-        Shape (T, F).
-
-    risk_dict : dict
-        Dict of sensitivities. Each key is a label for a derivative block.
-        Each value is either:
-          - 1D array length F      (diagonal terms only for that order)
-          - full tensor of shape (F, F, ..., F) with k repeats (full cross terms)
-        IMPORTANT: same factor ordering as moves_df.columns.
-
-        Example:
-        {
-            "first_derivative":  [delta_RF1, delta_RF2, ...],
-            "second_derivative": [[gamma_11, gamma_12, ...],
-                                   ...                     ],
-            "third_derivative":  [skew_RF1, skew_RF2, ...]
-        }
-
-    order_map : dict
-        Maps each key in risk_dict -> integer order k.
-        Example:
-        {
-            "first_derivative": 1,
-            "second_derivative": 2,
-            "third_derivative": 3,
-        }
-
-        This tells us how to scale with 1/k!, and what power
-        of dX to use.
+    x_known : np.ndarray
+        Known x points (1D, strictly increasing).
+    y_known : np.ndarray
+        Known y values at x_known.
+    x_query : np.ndarray
+        Target x points to evaluate.
+    interp_method : str
+        "linear" -> piecewise linear between knots
+        "cubic"  -> natural cubic spline between knots
+    extrap_method : str
+        "flat"   -> clamp to endpoint y
+        "linear" -> extend endpoint slope linearly
+        "cubic"  -> use cubic spline's natural extrapolation
 
     Returns
     -------
-    pd.DataFrame
-        Columns: one per order ("order_1", "order_2", ...), plus "total".
-        Index  : same as moves_df.index
-
-        Each column order_k is the P&L contribution from exactly that order.
-        "total" is the sum across all provided orders.
+    y_out : np.ndarray
+        Interpolated/extrapolated values at x_query.
+    extrap_mask : np.ndarray
+        Boolean array marking which x_query points were extrapolated.
     """
 
-    # factor moves matrix
-    dX = moves_df.to_numpy()  # shape (T, F)
-    T, F = dX.shape
+    x_known = np.asarray(x_known, dtype=float)
+    y_known = np.asarray(y_known, dtype=float)
+    x_query = np.asarray(x_query, dtype=float)
 
-    # Sanity: all keys in risk_dict must exist in order_map
-    missing = [k for k in risk_dict.keys() if k not in order_map]
-    if missing:
-        raise ValueError(f"order_map missing entries for keys: {missing}")
+    # basic validation
+    if x_known.ndim != 1 or y_known.ndim != 1:
+        raise ValueError("x_known and y_known must be 1D.")
+    if x_known.shape[0] != y_known.shape[0]:
+        raise ValueError("x_known and y_known must have same length.")
+    if not np.all(np.diff(x_known) > 0):
+        raise ValueError("x_known must be strictly increasing.")
 
-    # We'll accumulate PnL per *order k*
-    pnl_by_order = {}  # k -> np.array shape (T,)
+    # masks
+    left_mask = x_query < x_known[0]
+    right_mask = x_query > x_known[-1]
+    inside_mask = ~(left_mask | right_mask)
+    extrap_mask = ~inside_mask
 
-    for risk_key, sens in risk_dict.items():
-        k = int(order_map[risk_key])
+    # prepare storage
+    y_out = np.empty_like(x_query, dtype=float)
 
-        term_vec = _kth_order_term(dX, np.asarray(sens, dtype=float), k)
+    # --- build spline once if we'll need cubic anywhere ---
+    use_cubic = (interp_method == "cubic") or (extrap_method == "cubic")
+    cs = None
+    if use_cubic:
+        cs = CubicSpline(
+            x_known,
+            y_known,
+            bc_type="natural",
+            extrapolate=True  # allow cubic to speak outside too
+        )
 
-        # If multiple blocks map to same k, sum them (rare but allowed)
-        if k in pnl_by_order:
-            pnl_by_order[k] = pnl_by_order[k] + term_vec
+    # -----------------------
+    # 1. INTERPOLATION inside
+    # -----------------------
+    if np.any(inside_mask):
+        xin = x_query[inside_mask]
+
+        if interp_method == "linear":
+            # np.interp will only use linear between bracketing knots
+            y_in = np.interp(xin, x_known, y_known)
+
+        elif interp_method == "cubic":
+            # cubic spline inside range
+            y_in = cs(xin)
+
         else:
-            pnl_by_order[k] = term_vec
+            raise ValueError("interp_method must be 'linear' or 'cubic'.")
 
-    # Build output dataframe
-    out_cols = {}
-    total = np.zeros(T)
+        y_out[inside_mask] = y_in
 
-    for k in sorted(pnl_by_order.keys()):
-        col_name = f"order_{k}"
-        out_cols[col_name] = pnl_by_order[k]
-        total += pnl_by_order[k]
+    # -----------------------
+    # 2. EXTRAPOLATION outside
+    # -----------------------
+    # LEFT side
+    if np.any(left_mask):
+        xl = x_query[left_mask]
 
-    out_cols["total"] = total
+        if extrap_method == "flat":
+            y_left = np.full_like(xl, y_known[0], dtype=float)
 
-    return pd.DataFrame(out_cols, index=moves_df.index)
+        elif extrap_method == "linear":
+            slope_left = (y_known[1] - y_known[0]) / (x_known[1] - x_known[0])
+            y_left = y_known[0] + slope_left * (xl - x_known[0])
+
+        elif extrap_method == "cubic":
+            # natural spline extrapolation to the left
+            y_left = cs(xl)
+
+        else:
+            raise ValueError("extrap_method must be 'flat', 'linear', or 'cubic'.")
+
+        y_out[left_mask] = y_left
+
+    # RIGHT side
+    if np.any(right_mask):
+        xr = x_query[right_mask]
+
+        if extrap_method == "flat":
+            y_right = np.full_like(xr, y_known[-1], dtype=float)
+
+        elif extrap_method == "linear":
+            slope_right = ((y_known[-1] - y_known[-2]) /
+                           (x_known[-1] - x_known[-2]))
+            y_right = y_known[-1] + slope_right * (xr - x_known[-1])
+
+        elif extrap_method == "cubic":
+            y_right = cs(xr)
+
+        else:
+            raise ValueError("extrap_method must be 'flat', 'linear', or 'cubic'.")
+
+        y_out[right_mask] = y_right
+
+    return y_out, extrap_mask
