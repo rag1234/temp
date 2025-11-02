@@ -1,96 +1,139 @@
 import numpy as np
 import pandas as pd
-from arch import arch_model
+import math
 
-def fit_arma_garch(pnl_list,
-                   arma_order=(1, 0),
-                   garch_pq=(1, 1),
-                   dist="t",
-                   vol="GARCH"):
-    y = -np.asarray(pnl_list, dtype=float)
-    y = pd.Series(y - np.mean(y))
-    mean_type = 'ARX' if arma_order[0] > 0 else 'Constant'
-    am = arch_model(y, mean=mean_type,
-                    lags=arma_order[0] if arma_order[0] > 0 else 0,
-                    vol=vol, p=garch_pq[0], q=garch_pq[1],
-                    dist=dist, rescale=True)
-    res = am.fit(disp="off")
-    return am, res
+def taylor_pnl(
+    moves_df: pd.DataFrame,
+    risk_dict: dict
+) -> pd.DataFrame:
+    """
+    Compute P&L per date using Taylor expansion up to Nth order.
 
+    Parameters
+    ----------
+    moves_df : pd.DataFrame
+        Index = dates, columns = risk factors.
+        Values = actual factor moves Δx_i for that date.
+        Column order defines factor index order.
 
-def simulate_aggregated_losses(fitted_res, horizon_days, n_paths=100_000, seed=42):
-    rng = np.random.default_rng(seed)
-    am = fitted_res.model
-    params = fitted_res.params
-    sim = am.simulate(params, nobs=horizon_days, repetitions=n_paths, random_state=rng)
-    return sim['data'].sum(axis=0)
+    risk_dict : dict
+        Keys like "first_order", "second_order", ..., "n_order".
+        Values are sensitivities for that order:
+            order 1: shape (F,)
+            order 2: shape (F,F)  or (F,) for diagonal-only
+            order k: shape (F,)*k or (F,) for diagonal-only kth-order term.
+        Assumed to be w.r.t. the SAME factor ordering as moves_df.columns.
 
+    Returns
+    -------
+    pd.DataFrame
+        Columns:
+          - 'order_1', 'order_2', ..., 'total'
+        Index = same as moves_df.index
+    """
 
-def var_quantile_and_ci(samples, q=0.999, ci=0.9, n_boot=500, seed=1):
-    rng = np.random.default_rng(seed)
-    point = np.quantile(samples, q)
-    idx = np.arange(samples.size)
-    boots = [np.quantile(samples[rng.choice(idx, size=samples.size, replace=True)], q)
-             for _ in range(n_boot)]
-    lo, hi = np.quantile(boots, [(1 - ci) / 2, 1 - (1 - ci) / 2])
-    return point, (lo, hi)
+    # --- prep
+    factors = list(moves_df.columns)
+    dX = moves_df.to_numpy()              # shape (T, F)
+    T, F = dX.shape
 
+    # We'll accumulate per-order pnl in a dict of arrays shape (T,)
+    pnl_terms = {}
+    total_pnl = np.zeros(T)
 
-def economic_capital_projection(pnl_list,
-                                horizons=[63, 126],
-                                arma_order=(1, 0),
-                                garch_pq=(1, 1),
-                                vol="GARCH",
-                                dist="t",
-                                q=0.999,
-                                n_paths=200_000):
-    am, res = fit_arma_garch(pnl_list, arma_order, garch_pq, dist, vol)
-    results = {}
+    # helper: safe factorial coeff
+    def coeff(k: int) -> float:
+        return 1.0 / math.factorial(k)
 
-    # --- 1-day VaR from GARCH (model-implied)
-    agg_1d = simulate_aggregated_losses(res, 1, n_paths=n_paths, seed=99)
-    VaR_1d, _ = var_quantile_and_ci(agg_1d, q=q, ci=0.9, n_boot=100)
+    # iterate orders present in risk_dict
+    # We'll parse keys like "first_order","second_order","third_order",...
+    for key, sens in risk_dict.items():
+        # infer order k from key
+        # we'll strip "_order" and map 'first','second','third','fourth',...
+        # fallback: try to parse leading int if user uses "order_3" style
+        order_name = key.lower().strip()
 
-    for i, H in enumerate(horizons):
-        agg_losses = simulate_aggregated_losses(res, H, n_paths=n_paths, seed=100 + i)
-        var_point, ci_mc = var_quantile_and_ci(agg_losses, q=q, ci=0.9, n_boot=500, seed=200 + i)
-
-        # Scaled VaR via sqrt(h)
-        var_scaled = VaR_1d * np.sqrt(H)
-        ratio = var_point / var_scaled
-
-        results[f"{H}_days"] = {
-            "VaR_model": var_point,
-            "VaR_scaled": var_scaled,
-            "Ratio_model_to_scaled": ratio,
-            "CI_90%": ci_mc
+        # try common english ordinals first
+        ordinal_map = {
+            "first": 1, "second": 2, "third": 3, "fourth": 4,
+            "fifth": 5, "sixth": 6, "seventh": 7, "eighth": 8,
+            "ninth": 9, "tenth": 10
         }
+        k = None
+        for word, val in ordinal_map.items():
+            if order_name.startswith(word):
+                k = val
+                break
+        if k is None:
+            # fallback patterns like "order_3", "3rd_order", "thirdorder"
+            import re
+            m = re.search(r'(\d+)', order_name)
+            if m:
+                k = int(m.group(1))
+        if k is None:
+            raise ValueError(f"Cannot infer order from key '{key}'")
 
-    return results, VaR_1d, res.summary().as_text()
+        S = np.array(sens, dtype=float)
 
+        # compute kth order pnl term for all T days ->
+        # term_t = (1/k!) * sum_{i1..ik} S[i1..ik] * dX[t,i1]*...*dX[t,ik]
 
-# -----------------------
-# EXAMPLE USAGE
-# -----------------------
-if __name__ == "__main__":
-    np.random.seed(0)
-    pnl_list = np.random.normal(0, 1, 250)
-    horizons = [21, 63, 126, 252]
+        if S.ndim == 1:
+            # interpret as diagonal-only for that order:
+            # term_t = (1/k!) * sum_i S[i] * (dX[t,i])^k
+            # So you gave only the pure self term per factor.
+            if S.shape[0] != F:
+                raise ValueError(f"{key}: diagonal vector length {S.shape[0]} "
+                                 f"!= num factors {F}")
+            term = coeff(k) * np.sum(
+                (S * (dX ** k)), axis=1
+            )  # shape (T,)
+        else:
+            # full tensor case
+            # Example:
+            # k=2 -> S shape (F,F)
+            # k=3 -> S shape (F,F,F)
+            # etc.
+            # We'll use einsum:
+            # For k=2: term_t = 1/2 * Σ_ij S_ij dX_ti dX_tj
+            # -> einsum('t i, i j, t j -> t', dX, S, dX)
+            #
+            # For k=3: term_t = 1/6 * Σ_ijk S_ijk dX_ti dX_tj dX_tk
+            # -> einsum('t i, t j, t k, i j k -> t', dX, dX, dX, S)
+            #
+            # General k: einsum over: k copies of dX plus S.
 
-    results, VaR_1d, summary = economic_capital_projection(
-        pnl_list,
-        horizons=horizons,
-        arma_order=(1, 0),
-        garch_pq=(1, 1),
-        dist="t",
-        q=0.999,
-        n_paths=100_000
-    )
+            if S.shape != (F,) * k:
+                raise ValueError(
+                    f"{key}: tensor shape {S.shape} does not match "
+                    f"(num_factors,)*{k} = {(F,)*k}"
+                )
 
-    print(summary)
-    print(f"\nOne-day 99.9% VaR: {VaR_1d:.2f}\n")
-    print("--- Multi-horizon Comparison ---")
-    print(f"{'Horizon':>10} | {'Model VaR':>12} | {'Scaled VaR':>12} | {'Ratio (Model/Scaled)':>20} | {'CI_90%':>15}")
-    print("-"*80)
-    for h, vals in results.items():
-        print(f"{h:>10} | {vals['VaR_model']:12.2f} | {vals['VaR_scaled']:12.2f} | {vals['Ratio_model_to_scaled']:20.3f} | {vals['CI_90%']}")
+            # build einsum subscripts programmatically
+            # We'll create something like:
+            # inputs:  ['t i', 't j', 't k', 'i j k']
+            # output:  't'
+            idx_letters = list("ijklmnopqrstuvwxyzabcdefgh")  # enough distinct indices
+            idx = idx_letters[:k]  # e.g. ['i','j','k'] for k=3
+
+            # dX term subscripts: 't i', 't j', ...
+            dX_terms = [f"t {ix}" for ix in idx]
+            # S term subscripts: 'i j k'
+            S_term = " ".join(idx)
+
+            einsum_input = ",".join(dX_terms + [S_term])
+            einsum_output = "t"
+            subscript = f"{einsum_input}->{einsum_output}"
+
+            # Prepare args: k copies of dX plus S
+            args = [dX] * k + [S]
+
+            term = coeff(k) * np.einsum(subscript, *args)  # shape (T,)
+
+        pnl_terms[f"order_{k}"] = term
+        total_pnl += term
+
+    # final output dataframe
+    out = pd.DataFrame(index=moves_df.index, data=pnl_terms)
+    out["total"] = total_pnl
+    return out
